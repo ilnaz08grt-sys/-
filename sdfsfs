@@ -1,95 +1,60 @@
-manifest.json
-
-
-{
-  "manifest_version": 3,
-  "name": "Rust Tactical Radar Extension",
-  "version": "2.0",
-  "description": "Полная автопривязка серверов и Smart Alarm из игры Rust",
-  "permissions": ["storage", "gcm"],
-  "host_permissions": [
-    "https://companion-rust.facepunch.com/*",
-    "https://exp.host/*",
-    "https://*.onrender.com/*",
-    "http://*/*",
-    "https://*/*"
-  ],
-  "background": {
-    "service_worker": "background.js"
-  },
-  "action": {
-    "default_popup": "popup.html"
-  },
-  "content_scripts": [
-    {
-      "matches": ["https://companion-rust.facepunch.com/*"],
-      "js": ["inject.js"],
-      "run_at": "document_start",
-      "world": "MAIN"
-    },
-    {
-      "matches": ["https://companion-rust.facepunch.com/*"],
-      "js": ["content.js"],
-      "run_at": "document_start"
-    }
-  ]
-}
-
-
-
-inject.js
-
-
-
-
-
-window.ReactNativeWebView = {
-  postMessage: function(message) {
-    window.postMessage({ type: "FP_TOKEN_CAPTURED", payload: message }, "*");
-    let count = 0;
-    const timer = setInterval(() => {
-      window.postMessage({ type: "FP_TOKEN_CAPTURED", payload: message }, "*");
-      count++;
-      if (count >= 5) clearInterval(timer);
-    }, 400);
-  }
-};
-
-
-
-
 content.js
 
 
 
 
-let tokenSent = false;
+let isSending = false;
 
-window.addEventListener("message", (event) => {
-  if (event.data && event.data.type === "FP_TOKEN_CAPTURED" && !tokenSent) {
+window.addEventListener("message", async (event) => {
+  if (event.data && event.data.type === "FP_TOKEN_CAPTURED" && !isSending) {
     try {
       const data = typeof event.data.payload === "string" 
         ? JSON.parse(event.data.payload) 
         : event.data.payload;
 
-      if (data && data.Token) {
-        tokenSent = true;
-        showBanner("⏳ Токен получен! Подключаем автопривязку Facepunch...", "#f59e0b");
+      const token = data.Token || data.token;
+      const steamId = data.SteamId || data.steamId;
 
-        chrome.runtime.sendMessage({
-          action: "REGISTER_PUSH",
-          steamId: data.SteamId,
-          token: data.Token
-        }, (response) => {
-          if (response && response.success) {
-            showBanner("✅ АВТОПРИВЯЗКА АКТИВНА! Теперь жмите «Связать» в игре на сервере или будильнике!", "#10b981");
-          } else {
-            showBanner("❌ Ошибка: " + (response ? response.error : "Проверьте ссылку на бота в расширении"), "#ef4444");
-          }
+      if (!token) return;
+      isSending = true;
+
+      showBanner("⏳ Токен перехвачен! Отправляем напрямую в бота на Render...", "#f59e0b");
+
+      chrome.storage.local.get(["botUrl"], async (res) => {
+        if (!res.botUrl) {
+          showBanner("❌ Ошибка: Сначала укажите ссылку на Render в иконке расширения R!", "#ef4444");
+          isSending = false;
+          return;
+        }
+
+        // Сохраняем токен локально в расширении
+        chrome.storage.local.set({
+          fpConnected: true,
+          fpToken: token,
+          steamId: steamId,
+          lastLog: "✅ Токен активен (14 дней)"
         });
-      }
+
+        try {
+          const resp = await fetch(`${res.botUrl}/api/extension/status`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ active: true, steamId: steamId, fpToken: token })
+          });
+
+          if (resp.ok) {
+            showBanner("✅ ГОТОВО! Токен успешно передан боту! Можете закрыть эту вкладку.", "#10b981");
+          } else {
+            showBanner("❌ Render вернул ошибку " + resp.status, "#ef4444");
+            isSending = false;
+          }
+        } catch (err) {
+          showBanner("❌ Нет связи с Render! Проверьте ссылку в расширении.", "#ef4444");
+          isSending = false;
+        }
+      });
     } catch (e) {
-      console.error(e);
+      isSending = false;
     }
   }
 });
@@ -107,224 +72,19 @@ function showBanner(text, color) {
 }
 
 
-background.js
+
+inject.js
 
 
-
-
-
-
-const FACEPUNCH_SENDER_ID = "976529667804";
-
-async function getDeviceId() {
-  return new Promise((resolve) => {
-    chrome.storage.local.get(["deviceId"], (res) => {
-      if (res.deviceId) return resolve(res.deviceId);
-      const newId = "rustradar-" + Math.random().toString(36).substring(2, 12);
-      chrome.storage.local.set({ deviceId: newId }, () => resolve(newId));
-    });
-  });
-}
-
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  if (request.action === "REGISTER_PUSH") {
-    registerFacepunchPush(request.steamId, request.token)
-      .then((res) => sendResponse(res))
-      .catch((err) => sendResponse({ success: false, error: err.message }));
-    return true;
+window.ReactNativeWebView = {
+  postMessage: function(message) {
+    window.postMessage({ type: "FP_TOKEN_CAPTURED", payload: message }, "*");
+    let count = 0;
+    const timer = setInterval(() => {
+      window.postMessage({ type: "FP_TOKEN_CAPTURED", payload: message }, "*");
+      count++;
+      if (count >= 5) clearInterval(timer);
+    }, 400);
   }
-});
+};
 
-async function registerFacepunchPush(steamId, fpToken) {
-  try {
-    const fcmToken = await new Promise((resolve, reject) => {
-      chrome.gcm.register([FACEPUNCH_SENDER_ID], (regId) => {
-        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-        else resolve(regId);
-      });
-    });
-
-    const deviceId = await getDeviceId();
-
-    const expoRes = await fetch("https://exp.host/--/api/v2/push/getExpoPushToken", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        deviceId: deviceId,
-        experienceId: "@facepunch/rust-companion",
-        appId: "com.facepunch.rust.companion",
-        deviceToken: fcmToken,
-        type: "fcm",
-        development: false
-      })
-    });
-
-    const expoData = await expoRes.json();
-    if (!expoData.data || !expoData.data.expoPushToken) {
-      throw new Error("Не удалось получить Expo Push Token");
-    }
-
-    const fpRes = await fetch("https://companion-rust.facepunch.com/api/push/register", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        AuthToken: fpToken,
-        DeviceId: "RustRadarExtension",
-        PushKind: 0,
-        PushToken: expoData.data.expoPushToken
-      })
-    });
-
-    if (!fpRes.ok) throw new Error("Facepunch вернул статус " + fpRes.status);
-
-    chrome.storage.local.set({
-      fpConnected: true,
-      steamId: steamId,
-      lastLog: "Автопривязка активна (14 дней)"
-    });
-
-    chrome.storage.local.get(["botUrl"], (st) => {
-      if (st.botUrl) {
-        fetch(`${st.botUrl}/api/extension/status`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ active: true, steamId: steamId })
-        }).catch(() => {});
-      }
-    });
-
-    return { success: true };
-  } catch (err) {
-    chrome.storage.local.set({ fpConnected: false, lastLog: "Ошибка: " + err.message });
-    return { success: false, error: err.message };
-  }
-}
-
-chrome.gcm.onMessage.addListener((message) => {
-  try {
-    if (!message.data || !message.data.body) return;
-    const body = JSON.parse(message.data.body);
-
-    chrome.storage.local.get(["botUrl"], (res) => {
-      if (!res.botUrl) return;
-
-      fetch(`${res.botUrl}/api/extension/pair`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body)
-      })
-      .then((r) => r.json())
-      .then(() => {
-        const title = body.entityId 
-          ? `Привязан будильник #${body.entityId}` 
-          : `Привязан сервер ${body.name || body.ip}`;
-        chrome.storage.local.set({ lastLog: "✅ " + title });
-      })
-      .catch(() => {
-        chrome.storage.local.set({ lastLog: "❌ Ошибка связи с Render" });
-      });
-    });
-  } catch (e) {
-    console.error(e);
-  }
-});
-
-
-
-
-
-
-popup.html
-
-
-
-
-
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-  <meta charset="UTF-8">
-  <style>
-    body { width: 320px; background: #090b10; color: #f3f4f6; font-family: sans-serif; padding: 16px; margin: 0; }
-    h2 { font-size: 15px; margin: 0 0 12px 0; color: #fff; display: flex; align-items: center; justify-content: space-between; }
-    .badge { font-size: 10px; padding: 3px 8px; border-radius: 12px; background: #151a28; border: 1px solid #22293d; }
-    label { font-size: 11px; color: #8b949e; text-transform: uppercase; font-weight: bold; }
-    input {
-      width: 100%; box-sizing: border-box; background: #151a28; border: 1px solid #22293d;
-      color: #fff; padding: 10px; border-radius: 8px; margin: 6px 0 10px 0; font-size: 12px; outline: none;
-    }
-    button {
-      width: 100%; background: #2563eb; color: #fff; border: none; padding: 10px;
-      border-radius: 8px; font-weight: bold; cursor: pointer; margin-bottom: 8px; font-size: 12px;
-    }
-    button.btn-fp { background: #ce422b; }
-    .status-box { background: #151a28; border: 1px solid #22293d; border-radius: 8px; padding: 10px; font-size: 12px; margin-top: 8px; }
-    .status-row { display: flex; justify-content: space-between; margin-bottom: 6px; }
-    .status-row:last-child { margin-bottom: 0; }
-  </style>
-</head>
-<body>
-  <h2>📡 RustRadar Автопривязка <span class="badge">v2.0</span></h2>
-  
-  <label>1. Ссылка на вашего бота (Render):</label>
-  <input type="text" id="botUrl" placeholder="https://ваш-бот.onrender.com">
-  <button id="saveBtn">Сохранить ссылку</button>
-
-  <label>2. Авторизация Facepunch:</label>
-  <button class="btn-fp" id="loginBtn" style="margin-top:6px;">🔑 Войти через Steam (Facepunch)</button>
-
-  <div class="status-box">
-    <div class="status-row">
-      <span style="color:#8b949e;">Статус токена:</span>
-      <b id="fpStatus">Не подключен ❌</b>
-    </div>
-    <div class="status-row">
-      <span style="color:#8b949e;">Событие:</span>
-      <span id="lastLog" style="color:#10b981; font-size:11px;">Ожидание...</span>
-    </div>
-  </div>
-  <script src="popup.js"></script>
-</body>
-</html>
-
-
-
-
-
-popup.js
-
-
-
-
-
-document.addEventListener("DOMContentLoaded", () => {
-  const input = document.getElementById("botUrl");
-  const fpStatus = document.getElementById("fpStatus");
-  const lastLog = document.getElementById("lastLog");
-
-  function refreshUI() {
-    chrome.storage.local.get(["botUrl", "fpConnected", "lastLog"], (res) => {
-      if (res.botUrl) input.value = res.botUrl;
-      if (res.fpConnected) {
-        fpStatus.innerText = "Активен (14 дн.) 🟢";
-        fpStatus.style.color = "#10b981";
-      } else {
-        fpStatus.innerText = "Ожидание входа ❌";
-        fpStatus.style.color = "#ef4444";
-      }
-      if (res.lastLog) lastLog.innerText = res.lastLog;
-    });
-  }
-
-  document.getElementById("saveBtn").addEventListener("click", () => {
-    let url = input.value.trim().replace(/\/+$/, "");
-    if (!url) return;
-    chrome.storage.local.set({ botUrl: url, lastLog: "✅ Ссылка сохранена!" }, refreshUI);
-  });
-
-  document.getElementById("loginBtn").addEventListener("click", () => {
-    chrome.tabs.create({ url: "https://companion-rust.facepunch.com/login" });
-  });
-
-  refreshUI();
-});
